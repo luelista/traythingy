@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-import sys
+import sys, os, json
 from PyQt5 import QtWidgets, QtCore, QtGui
 import os.path
 import runpy
 import subprocess
 #from Cocoa import *
 
+from PyQt5.Qsci import QsciScintilla, QsciLexerPython, QsciLexerCPP
 
 def getConfigPath():
 	home = os.path.expanduser("~")
-	return os.path.join(home, ".config/traythingy.cfg.py")
+	return os.path.join(home, ".config/traythingy.json")
 
 
 def load_file_watch(parent, filename, callback):
@@ -25,41 +26,53 @@ def load_file_watch(parent, filename, callback):
 	cb()
 
 class OutWnd(QtWidgets.QWidget):
-	def __init__(self, item, parent=None):
+	def __init__(self, item, config, parent=None):
 		super().__init__(parent)
-		self.config = item
+		self.itemInfo = item
+		self.config = config
+		if "exec" in item:
+			self.cmdLine = item["exec"]
+			if "run_on" in item:
+				if item["run_on"] != self.config['hostname']:
+					self.cmdLine = self.config['remotes'][item['run_on']] + self.cmdLine
+		elif "http_get" in item:
+			self.cmdLine = 'curl "%s"' % item["http_get"]
 		self.setWindowFlags(QtCore.Qt.WindowStaysOnTopHint)
 		self.setWindowTitle(item.get("showTitle", "Output"))
 		self.initUI()
 		self.resize(500,200)
 		self.show()
 		self.activateWindow()
-		self.txt.setStyleSheet("background-color: #ffeeaa")
-		self.txt.setText(item["exec"] + "\n")
+		self.txt.setStyleSheet("background-color: " + ("#ffffff" if self.itemInfo.get("keep",False) else "#ffeeaa"))
+		self.txt.setText(self.cmdLine + "\n")
 		self.proc = QtCore.QProcess()
 		self.proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
 		self.proc.readyReadStandardOutput.connect(
 			lambda: self.txt.append(str(self.proc.readAllStandardOutput().data().decode('utf-8'))))
 		self.proc.finished.connect(self.procFinished)
-		self.proc.start(item["exec"])
+		print("CMD:",self.cmdLine)
+		self.proc.start("sh", ["-c", self.cmdLine])
+
 	def procFinished(self, code, status):
 		self.txt.append("\nProcess exited with code "+str(code)+", status "+str(status)+"\n")
 		if code == 0:
 			self.txt.setStyleSheet("background-color: #aaffaa")
+			if not self.itemInfo.get("keep",False):
+				QtCore.QTimer.singleShot(250, lambda: self.close())
 		else:
 			self.txt.setStyleSheet("background-color: #ffaaaa")
-		if not self.config.get("keep",False):
-			QtCore.QTimer.singleShot(250, lambda: self.close())
 
 	def initUI(self):
 		self.setLayout(QtWidgets.QVBoxLayout())
 		self.layout().setContentsMargins(QtCore.QMargins(0,0,0,0))
 		self.txt = QtWidgets.QTextEdit()
 		self.layout().addWidget(self.txt)
+
 	def keyPressEvent(self, evt):
 		print("key",evt,evt.key())
 		if evt.key() == QtCore.Qt.Key_Control:
-			self.config['keep']=True
+			self.itemInfo['keep']=True
+			self.txt.setStyleSheet("background-color: " + "#ffffff" )
 		if evt.key() == QtCore.Qt.Key_Escape:
 			if self.proc.state() == QtCore.QProcess.Running:
 				self.proc.kill()
@@ -72,44 +85,45 @@ class SystemTrayIcon(QtWidgets.QSystemTrayIcon):
 		self.menu = QtWidgets.QMenu(self.parent())
 		self.menuItems = []
 		
-		self.confModule = exec(configCode, {'app':self})
-		
-		exitAction = self.menu.addAction("Exit")
-		exitAction.triggered.connect(self.exit)
+		self.config = json.loads(configCode)
+		for idx,item in enumerate(self.config['menu']):
+			if item['name'] == '-':
+				self.menu.addSeparator()
+				continue
+			action = self.menu.addAction(item['name'])
+			if 'icon' in item:
+				action.setIcon(QtGui.QIcon(item['icon']))
+			if 'exec' in item or 'func' in item or 'http_get' in item:
+				action.triggered.connect(lambda c,idx=idx: self.doAction(idx))
+			else:
+				action.setDisabled(True)
+
+		self.menu.addSeparator()
+		action = self.menu.addAction("↪️ Relaunch")
+		action.triggered.connect(lambda: self.run_cmd({'exec': 'sh -c "'+sys.argv[0]+' & kill '+str(os.getpid())+'"'}))
+		action = self.menu.addAction("Exit")
+		action.triggered.connect(self.exit)
 		
 		self.setContextMenu(self.menu)
-	
-	def addItem(self, **item):
-		self.menuItems.append(item)
-		action = self.menu.addAction(item['name'])
-		if 'icon' in item:
-			action.setIcon(QtGui.QIcon(item['icon']))
-		if 'exec' in item or 'func' in item:
-			action.triggered.connect(lambda c,idx=len(self.menuItems)-1: self.doAction(idx))
-		else:
-			action.setDisabled(True)
-	def addSeparator(self):
-		self.menu.addSeparator()
-	def addTitle(self, text):
-		self.menu.addSection(text)
-	def doAction(self, idx):
-		item = self.menuItems[idx]
-		print("running",idx,item)
-		if 'exec' in item:
-			try:
-				self.wnd = OutWnd(item)
-				#self.wnd.raise()
-				#NSApp.activateIgnoringOtherApps_(True)
-				#QtWidgets.QMessageBox.information(self.parent(), "Output", out.decode("utf-8", "replace"))
 
-			except Exception as e:
-				print(e)
-				QtWidgets.QMessageBox.warning(self.parent(), "Error", str(e))
-		elif 'func' in item:
+	def doAction(self, idx):
+		item = self.config['menu'][idx]
+		print("running",idx,item)
+		if 'func' in item:
 			item['func'](self)
+		else:
+			self.run_cmd(item)
+
+	def run_cmd(self, item):
+		try:
+			self.wnd = OutWnd(item, self.config)
+		except Exception as e:
+			print(e)
+			QtWidgets.QMessageBox.warning(self.parent(), "Error", str(e))
 
 	def __init__(self, icon, parent=None):
 		super().__init__(icon, parent)
+		self.config = {}
 		load_file_watch(self, getConfigPath(), self.initMenu)
 	
 	def exit(self):
@@ -220,6 +234,87 @@ def showScintillaDialog(parent, title, content, ok_callback):
 	if dlg.exec() == QDialog.Rejected: return None
 	return sg.text()
 
+
+
+class RpcTransport:
+	def __init__(self, handler):
+		self.peers = list()
+		self.handler = handler
+	async def advertise(self, meta):
+		pass
+	async def getSelfAddresses(self):
+		return []
+	async def findPeerConnections(self, peer_id):
+		pass
+
+class UdpSimpleRpcTransport(RpcTransport):
+	DUMMY_SESSION = b"\0"*12
+	def __init__(self, handler, bindAddress):
+		super().__init__(handler)
+		self._drain_lock = asyncio.Lock(loop=handler.loop)
+		self.bindHost, self.bindPort = UdpSimpleRpcTransport.parseAddress(bindAddress)
+		self.connections = dict()
+		self.waiting_for_peer = list()
+
+	@staticmethod
+	def parseAddress(adr):
+		match = re.match("/ip/([^/]+)/udp/(\d+)", adr)
+		return (match.group(1), int(match.group(2)))
+
+	async def getSelfAddresses(self):
+		return ["/ip/%s/udp/%d"% (ip, self.bindPort) for ip in [self.bindHost]]
+
+	async def advertise(self, meta):
+		enc_msg = self.encrypt_adv_msg(meta)
+		self.asyncio_transport.sendto(UdpSimpleRpcTransport.DUMMY_SESSION + enc_msg,
+									  ("255.255.255.255", self.bindPort))
+
+	def encrypt_adv_msg(self, meta):
+		raw_msg = xdrm.dumps(meta)
+		signed_msg = self.handler.keypair.sign(raw_msg)
+		return pyhy.hydro_secretbox_encrypt(signed_msg, 0, CTX, self.handler.netkey)
+
+	async def findPeerConnections(self, peer_id):
+		enc_msg = self.encrypt_adv_msg({"id": self.handler.pk, "find":peer_id})
+		self.asyncio_transport.sendto(UdpSimpleRpcTransport.DUMMY_SESSION + enc_msg,
+									  ("255.255.255.255", self.bindPort))
+
+	async def connect(self, addr):
+		return self.make_connection(UdpSimpleRpcTransport.parseAddress(addr))
+
+	async def run(self):
+		transport, protocol = await self.handler.loop.create_datagram_endpoint(lambda: self,
+												   local_addr=(self.bindHost,self.bindPort),
+								  reuse_address=True, reuse_port=True, allow_broadcast=True)
+
+	def connection_made(self, transport):
+		self.asyncio_transport = transport
+
+	def make_connection(self, addr):
+		try:
+			return self.connections[addr]
+		except KeyError:
+			self.connections[addr] = UdpRpcConnection(self, addr)
+
+	def datagram_received(self, datagram_bytes, addr):
+		session_id, frame = datagram_bytes[0:12], datagram_bytes[12:]
+		print('Received %r from %s' % (session_id, addr))
+		if session_id == UdpSimpleRpcTransport.DUMMY_SESSION:
+			dec_datagram_bytes = pyhy.hydro_secretbox_decrypt(frame, 0, CTX, self.handler.netkey)
+
+			data = sign_unpack(dec_datagram_bytes)
+			data['adr'].append("/ip/%s/udp/%d" % addr)
+			self.handler.handleAdvertise(data)
+		else:
+			conn = self.make_connection(addr)
+			self.handler.handleData(session_id, frame, conn)
+		#
+		#print('Send %r to %s' % (message, addr))
+		#self.asyncio_transport.sendto(data, addr)
+
+	def error_received(self, exc):
+		print("Error in UdpSimpleRpcTransport")
+		print(exc)
 
 
 
