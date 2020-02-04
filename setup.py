@@ -10,7 +10,7 @@ from setuptools import setup
 APP = ['traythingy.py']
 DATA_FILES = ['rainbow_1f308.png']
 OPTIONS = {
-'plist': {'LSUIElement': True},
+  'plist': {'LSUIElement': True},
 }
 
 setup(

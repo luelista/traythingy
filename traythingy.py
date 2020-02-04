@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.7
 import sys, os, json
 from PyQt5 import QtWidgets, QtCore, QtGui
 import os.path
