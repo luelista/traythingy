@@ -1,0 +1,13 @@
+[project]
+name = "traythingy"
+version = "0.0.1"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pyqt5>=5.14.0",
+    "qscintilla>=2.0.0",
+]
+
+[project.gui-scripts]
+traythingy = "traythingy:main"

@@ -10,20 +10,25 @@ from PyQt5.Qsci import QsciScintilla, QsciLexerPython, QsciLexerCPP
 
 def getConfigPath():
 	home = os.path.expanduser("~")
-	return os.path.join(home, ".config/traythingy.json")
+	return os.path.join(home, ".config/traythingy/traythingy.json")
 
 
 def load_file_watch(parent, filename, callback):
 	def cb(p=""):
+		print("load_file_watch: ",p, os.path.realpath(p) != os.path.realpath(filename), os.path.realpath(p), os.path.realpath(filename))
+		fsw.addPath(filename)
+		if os.path.realpath(p) != os.path.realpath(filename): return
 		try:
 			with open(filename, "r") as f:
 				data = f.read()
-		except:
+		except Exception as e:
+			print(e)
 			return
 		callback(data)
-	fsw = QtCore.QFileSystemWatcher([filename], parent)
+	fsw = QtCore.QFileSystemWatcher([filename, os.path.dirname(filename)], parent)
 	fsw.fileChanged.connect(cb)
-	cb()
+	fsw.directoryChanged.connect(cb)
+	cb(filename)
 
 class OutWnd(QtWidgets.QWidget):
 	def __init__(self, item, config, parent=None):
@@ -82,9 +87,9 @@ class OutWnd(QtWidgets.QWidget):
 
 class SystemTrayIcon(QtWidgets.QSystemTrayIcon):
 	def initMenu(self, configCode):
-		self.menu = QtWidgets.QMenu(self.parent())
+		print("Updating menu", len(configCode))
 		self.menuItems = []
-		
+		self.menu.clear()
 		self.config = json.loads(configCode)
 		for idx,item in enumerate(self.config['menu']):
 			if item['name'] == '-':
@@ -104,7 +109,7 @@ class SystemTrayIcon(QtWidgets.QSystemTrayIcon):
 		action = self.menu.addAction("Exit")
 		action.triggered.connect(self.exit)
 		
-		self.setContextMenu(self.menu)
+		print(self.config)
 
 	def doAction(self, idx):
 		item = self.config['menu'][idx]
@@ -123,6 +128,8 @@ class SystemTrayIcon(QtWidgets.QSystemTrayIcon):
 
 	def __init__(self, icon, parent=None):
 		super().__init__(icon, parent)
+		self.menu = QtWidgets.QMenu(self.parent())
+		self.setContextMenu(self.menu)
 		self.config = {}
 		load_file_watch(self, getConfigPath(), self.initMenu)
 	
@@ -258,7 +265,7 @@ class UdpSimpleRpcTransport(RpcTransport):
 
 	@staticmethod
 	def parseAddress(adr):
-		match = re.match("/ip/([^/]+)/udp/(\d+)", adr)
+		match = re.match(r"/ip/([^/]+)/udp/(\d+)", adr)
 		return (match.group(1), int(match.group(2)))
 
 	async def getSelfAddresses(self):
@@ -321,7 +328,8 @@ class UdpSimpleRpcTransport(RpcTransport):
 
 
 
-def main(image):
+def main():
+	image='rainbow_1f308.png'
 	app = QtWidgets.QApplication(sys.argv)
 	app.setQuitOnLastWindowClosed(False)
 	w = QtWidgets.QWidget()
@@ -331,5 +339,4 @@ def main(image):
 
 
 if __name__ == '__main__':
-	on='rainbow_1f308.png'
-	main(on)
+	main()
