@@ -1,12 +1,22 @@
 #!/usr/bin/env python3.7
 import sys, os, json
 from PyQt5 import QtWidgets, QtCore, QtGui
+from PyQt5.QtCore import pyqtSlot
 import os.path
 import runpy
 import subprocess
 #from Cocoa import *
 
 from PyQt5.Qsci import QsciScintilla, QsciLexerPython, QsciLexerCPP
+from qasync import QEventLoop, QApplication, asyncSlot
+import asyncio
+
+from datetime import datetime
+
+from easyrpc.connection import autoconnect_from_env
+from easyrpc.rpc import RpcOp
+from easyrpc.db import blobstore
+from functools import wraps
 
 def getConfigPath():
 	home = os.path.expanduser("~")
@@ -29,6 +39,31 @@ def load_file_watch(parent, filename, callback):
 	fsw.fileChanged.connect(cb)
 	fsw.directoryChanged.connect(cb)
 	cb(filename)
+
+
+
+## from : https://gist.github.com/medihack/7af1f98ea468aa7ad00102c7d84c65d8
+def async_debounce(wait):
+	def decorator(func):
+		waiting = False
+
+		@wraps(func)
+		async def debounced(*args, **kwargs):
+			nonlocal waiting
+
+			def call_func():
+				nonlocal waiting
+				waiting = False
+				asyncio.ensure_future(func(*args, **kwargs))
+
+			if not waiting:
+				asyncio.get_running_loop().call_later(wait, call_func)
+				waiting = True
+
+		return debounced
+
+	return decorator
+
 
 class OutWnd(QtWidgets.QWidget):
 	def __init__(self, item, config, parent=None):
@@ -84,38 +119,127 @@ class OutWnd(QtWidgets.QWidget):
 			else:
 				self.close()
 
+from easyrpc.helpers import AsyncSignal
+
+class DocDb:
+	def __init__(self, rpc):
+		self.documents = {}
+		self.rpc = rpc
+		self.remote_item_updated = AsyncSignal()
+
+	async def _update_doc(self, doc_id, items):
+		if doc_id not in self.documents:
+			self.documents[doc_id] = dict()
+		for item in items:
+			self.documents[doc_id][item['id']] = item
+		await self.remote_item_updated.emit(doc_id, items)
+
+	async def fetch_doc(self, doc_id):
+		if doc_id in self.documents: return
+		result = await self.rpc.caller.node('pb').pb.pb.get_updates([[doc_id, 0]], True)
+		for doc in result['docs']:
+			await self._update_doc(doc['document'], doc['items'])
+	
+	async def get_items(self, doc_id):
+		await self.fetch_doc(doc_id)
+		return self.documents[doc_id]
+
+	async def search(self, doc_id=None, filter=None, order_by=None, order_desc=False):
+		if doc_id:
+			await self.fetch_doc(doc_id)
+			items = self.documents[doc_id].values()
+		else:
+			items = (item for doc in self.documents.values() for item in doc)
+		items = (item for item in items if not item.get('deleted'))
+		if filter:
+			items = (item for item in items if filter(item))
+		if order_by:
+			items = sorted(items, key=lambda item: item.get(order_by), reverse=order_desc)
+		return items
 
 class SystemTrayIcon(QtWidgets.QSystemTrayIcon):
-	def initMenu(self, configCode):
-		print("Updating menu", len(configCode))
+	async def add_item(self, idx, item):
+		if item['title'] == '-':
+			self.menu.addSeparator()
+			return
+		action = self.menu.addAction(item['title'])
+		if 'icon' in item:
+			if len(item['icon']) < 3:
+				action.setText(item['icon'] + ' ' + item['title'])
+			elif len(item['icon']) in (64, 86):
+				data = await blobstore.retrieve_blob(self.rpc, 'pb', 'pb', item['icon'], 10, cache=True)
+				#action.setIcon(QtGui.QIcon(data))
+				img = QtGui.QImage()
+				img.loadFromData(data)
+				action.setIcon(QtGui.QIcon(QtGui.QPixmap.fromImage(img)))
+			else:
+				action.setIcon(QtGui.QIcon(item['icon']))
+		if 'exec' in item or 'func' in item or 'http_get' in item or 'rpc' in item:
+			@asyncSlot()
+			async def _onclick(_):
+				await self.doAction(item)
+			action.triggered.connect(_onclick)
+		else:
+			action.setDisabled(True)
+
+	@async_debounce(0.5)
+	async def refreshMenu(self):
 		self.menuItems = []
 		self.menu.clear()
-		self.config = json.loads(configCode)
-		for idx,item in enumerate(self.config['menu']):
-			if item['name'] == '-':
-				self.menu.addSeparator()
-				continue
-			action = self.menu.addAction(item['name'])
-			if 'icon' in item:
-				action.setIcon(QtGui.QIcon(item['icon']))
-			if 'exec' in item or 'func' in item or 'http_get' in item:
-				action.triggered.connect(lambda c,idx=idx: self.doAction(idx))
-			else:
-				action.setDisabled(True)
+		try:
+			doc = self.get_journal_doc_id()
+			if self.db and doc:
+				nowplaying = list(await self.db.search(
+					doc_id=doc,
+					filter=lambda item: item.get('icon') in ('🔜','🔛') or item.get('cal'),
+					order_by='y'
+				))
+				for idx, item in enumerate(nowplaying):
+					await self.add_item(idx, { 'title': item.get('text'), 'icon': item.get('icon') })
+				if len(nowplaying):
+					self.menu.addSeparator()
+		except Exception as e:
+			logging.exception(e)
+			pass
 
+		try:
+			for idx, item in enumerate(self.config['menu']):
+				await self.add_item(idx, item)
+		except Exception as e:
+			logging.exception(e)
+			pass
+
+		try:
+			doc = self.config.get("settings_doc")
+			if self.db and doc:
+				for idx, item in enumerate(await self.db.search(
+					doc_id=doc,
+					filter=lambda item: item.get('opt') == 'menu',
+					order_by='y'
+				)):
+					await self.add_item(idx, item)
+		except Exception as e:
+			logging.exception(e)
+			pass
+		
+		
 		self.menu.addSeparator()
 		action = self.menu.addAction("↪️ Relaunch")
 		action.triggered.connect(lambda: self.run_cmd({'exec': 'sh -c "'+sys.argv[0]+' & kill '+str(os.getpid())+'"'}))
 		action = self.menu.addAction("Exit")
 		action.triggered.connect(self.exit)
-		
-		print(self.config)
 
-	def doAction(self, idx):
-		item = self.config['menu'][idx]
-		print("running",idx,item)
+	async def doAction(self, item):
+		print("running",item)
 		if 'func' in item:
 			item['func'](self)
+		elif 'rpc' in item:
+			try:
+				result = await self.rpc.caller._call(RpcOp.METHODCALL, item['rpc'][0], item['rpc'][1], item['rpc'][2], item['rpc'][3], item['rpc'][4], {}, item.get('timeout', 10))
+				if result and not item.get('no_output'):
+					self.show_info(repr(result))
+			except Exception as e:
+				self.show_error(str(e))
 		else:
 			self.run_cmd(item)
 
@@ -124,15 +248,79 @@ class SystemTrayIcon(QtWidgets.QSystemTrayIcon):
 			self.wnd = OutWnd(item, self.config)
 		except Exception as e:
 			print(e)
-			QtWidgets.QMessageBox.warning(self.parent(), "Error", str(e))
+			self.show_error(str(e))
+
+	@asyncSlot()
+	async def configChanged(self, new_config):
+		print("Updating menu", len(new_config))
+		self.config = json.loads(new_config)
+		doc = self.config.get("settings_doc")
+		if doc and self.db:
+			await self.db.fetch_doc(doc)
+		await self.refreshMenu()
+
+	@pyqtSlot()
+	def show_info(self, info):
+		def _do():
+			QtWidgets.QMessageBox.information(self.parent(), "Success", info)
+		QtCore.QTimer.singleShot(0, _do)
+
+	@pyqtSlot()
+	def show_error(self, info):
+		def _do():
+			QtWidgets.QMessageBox.warning(self.parent(), "Error", info)
+		QtCore.QTimer.singleShot(0, _do)
 
 	def __init__(self, icon, parent=None):
 		super().__init__(icon, parent)
 		self.menu = QtWidgets.QMenu(self.parent())
+		action = self.menu.addAction("Exit")
+		action.triggered.connect(self.exit)
 		self.setContextMenu(self.menu)
 		self.config = {}
-		load_file_watch(self, getConfigPath(), self.initMenu)
-	
+		self.activated.connect(self.on_activated)
+		self.db = None
+		load_file_watch(self, getConfigPath(), self.configChanged)
+		asyncio.ensure_future(self.connect_rpc())
+
+	async def on_remote_item_updated(self, doc, items):
+		if (doc == self.config.get('settings_doc') and any(item.get('opt') == 'menu' for item in items)) \
+				or doc == self.get_journal_doc_id():
+			await self.refreshMenu()
+
+	def get_journal_doc_id(self):
+		doc = self.config.get("journal_doc")
+		if doc:
+			return datetime.now().strftime(doc)
+
+	async def connect_rpc(self):
+		self.rpc = autoconnect_from_env()
+		await self.rpc.connect()
+		
+		self.db = DocDb(self.rpc)
+		self.db.remote_item_updated.on(self.on_remote_item_updated)
+		doc = self.config.get("settings_doc")
+		if doc:
+			await self.db.fetch_doc(doc)
+		doc = self.get_journal_doc_id()
+		if doc:
+			await self.db.fetch_doc(doc)
+
+		while True:
+			event = await self.rpc.server_events.get()
+			if event.event_name == 'chat_event' or event.event_name == 'notification':
+				chat = event.args[0]
+				message = chat.get("message", "")
+				title = chat.get("title", f"message from {chat.get("from")}")
+				icon = chat.get("icon")
+				icon = {"warning": SystemTrayIcon.Warning, "info": SystemTrayIcon.Information, "critical": SystemTrayIcon.Critical, "": SystemTrayIcon.NoIcon}.get(icon, SystemTrayIcon.Warning)
+				self.showMessage(title, message, icon)
+			elif event.event_name == 'doc_event':
+				doc_id, items = event.args
+				await self.db._update_doc(doc_id, items)
+			#else:
+				#self.showMessage("Event received: %s.%s.%s.%s" % (event.node, event.object, event.interface, event.event_name), repr(event.args), SystemTrayIcon.Warning)
+
 	def exit(self):
 		QtCore.QCoreApplication.exit()
 
@@ -242,100 +430,27 @@ def showScintillaDialog(parent, title, content, ok_callback):
 	return sg.text()
 
 
-
-class RpcTransport:
-	def __init__(self, handler):
-		self.peers = list()
-		self.handler = handler
-	async def advertise(self, meta):
-		pass
-	async def getSelfAddresses(self):
-		return []
-	async def findPeerConnections(self, peer_id):
-		pass
-
-class UdpSimpleRpcTransport(RpcTransport):
-	DUMMY_SESSION = b"\0"*12
-	def __init__(self, handler, bindAddress):
-		super().__init__(handler)
-		self._drain_lock = asyncio.Lock(loop=handler.loop)
-		self.bindHost, self.bindPort = UdpSimpleRpcTransport.parseAddress(bindAddress)
-		self.connections = dict()
-		self.waiting_for_peer = list()
-
-	@staticmethod
-	def parseAddress(adr):
-		match = re.match(r"/ip/([^/]+)/udp/(\d+)", adr)
-		return (match.group(1), int(match.group(2)))
-
-	async def getSelfAddresses(self):
-		return ["/ip/%s/udp/%d"% (ip, self.bindPort) for ip in [self.bindHost]]
-
-	async def advertise(self, meta):
-		enc_msg = self.encrypt_adv_msg(meta)
-		self.asyncio_transport.sendto(UdpSimpleRpcTransport.DUMMY_SESSION + enc_msg,
-									  ("255.255.255.255", self.bindPort))
-
-	def encrypt_adv_msg(self, meta):
-		raw_msg = xdrm.dumps(meta)
-		signed_msg = self.handler.keypair.sign(raw_msg)
-		return pyhy.hydro_secretbox_encrypt(signed_msg, 0, CTX, self.handler.netkey)
-
-	async def findPeerConnections(self, peer_id):
-		enc_msg = self.encrypt_adv_msg({"id": self.handler.pk, "find":peer_id})
-		self.asyncio_transport.sendto(UdpSimpleRpcTransport.DUMMY_SESSION + enc_msg,
-									  ("255.255.255.255", self.bindPort))
-
-	async def connect(self, addr):
-		return self.make_connection(UdpSimpleRpcTransport.parseAddress(addr))
-
-	async def run(self):
-		transport, protocol = await self.handler.loop.create_datagram_endpoint(lambda: self,
-												   local_addr=(self.bindHost,self.bindPort),
-								  reuse_address=True, reuse_port=True, allow_broadcast=True)
-
-	def connection_made(self, transport):
-		self.asyncio_transport = transport
-
-	def make_connection(self, addr):
-		try:
-			return self.connections[addr]
-		except KeyError:
-			self.connections[addr] = UdpRpcConnection(self, addr)
-
-	def datagram_received(self, datagram_bytes, addr):
-		session_id, frame = datagram_bytes[0:12], datagram_bytes[12:]
-		print('Received %r from %s' % (session_id, addr))
-		if session_id == UdpSimpleRpcTransport.DUMMY_SESSION:
-			dec_datagram_bytes = pyhy.hydro_secretbox_decrypt(frame, 0, CTX, self.handler.netkey)
-
-			data = sign_unpack(dec_datagram_bytes)
-			data['adr'].append("/ip/%s/udp/%d" % addr)
-			self.handler.handleAdvertise(data)
-		else:
-			conn = self.make_connection(addr)
-			self.handler.handleData(session_id, frame, conn)
-		#
-		#print('Send %r to %s' % (message, addr))
-		#self.asyncio_transport.sendto(data, addr)
-
-	def error_received(self, exc):
-		print("Error in UdpSimpleRpcTransport")
-		print(exc)
-
-
-
-
-
+import logging
+from easyrpc.helpers import CustomLogFormatter
+logging.basicConfig(level=logging.DEBUG)
+logging.root.handlers[0].setFormatter(CustomLogFormatter())
 
 def main():
 	image='rainbow_1f308.png'
-	app = QtWidgets.QApplication(sys.argv)
+	app = QApplication(sys.argv)
+	
+	event_loop = QEventLoop(app)
+	asyncio.set_event_loop(event_loop)
+	app_close_event = asyncio.Event()
+	app.aboutToQuit.connect(app_close_event.set)
+
 	app.setQuitOnLastWindowClosed(False)
 	w = QtWidgets.QWidget()
 	trayIcon = SystemTrayIcon(QtGui.QIcon(image), w)
 	trayIcon.show()
-	sys.exit(app.exec_())
+
+	with event_loop:
+		event_loop.run_until_complete(app_close_event.wait())
 
 
 if __name__ == '__main__':
