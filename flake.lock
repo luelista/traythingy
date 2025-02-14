@@ -2,11 +2,11 @@
   "nodes": {
     "nixpkgs": {
       "locked": {
-        "lastModified": 1739214665,
-        "narHash": "sha256-26L8VAu3/1YRxS8MHgBOyOM8xALdo6N0I04PgorE7UM=",
+        "lastModified": 1739446958,
+        "narHash": "sha256-+/bYK3DbPxMIvSL4zArkMX0LQvS7rzBKXnDXLfKyRVc=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "64e75cd44acf21c7933d61d7721e812eac1b5a0a",
+        "rev": "2ff53fe64443980e139eaa286017f53f88336dd0",
         "type": "github"
       },
       "original": {
@@ -16,9 +16,32 @@
         "type": "github"
       }
     },
+    "pinboard": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "dir": "connectors/python",
+        "lastModified": 1739538257,
+        "narHash": "sha256-e0pEvZ4MF/ANzEX+JAkcT2QSHVvRGvEV03VIYf+HpZ4=",
+        "ref": "refs/heads/master",
+        "rev": "cf28144d9c4dbe8c878aea49346d276cb2d0b707",
+        "revCount": 568,
+        "type": "git",
+        "url": "ssh://git@github.com/luelista/pinboard.git"
+      },
+      "original": {
+        "dir": "connectors/python",
+        "type": "git",
+        "url": "ssh://git@github.com/luelista/pinboard.git"
+      }
+    },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "pinboard": "pinboard"
       }
     }
   },

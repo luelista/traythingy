@@ -1,7 +1,13 @@
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    pinboard.url = "/home/mira/Repos/miau/pinboard-next/connectors/python";
+    #pinboard.url = "/home/mira/Repos/miau/pinboard-next/connectors/python";
+    pinboard = {
+      type = "git";
+      url = "ssh://git@github.com/luelista/pinboard.git";
+      dir = "connectors/python";
+    };
+    #pinboard.url = "git+ssh://git@github.com/luelista/pinboard.git?dir=connectors";
     pinboard.inputs.nixpkgs.follows = "nixpkgs";
   };
   outputs = { self, nixpkgs, pinboard, ... }: {

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3.7
 import sys, os, json
-from PyQt5 import QtWidgets, QtCore, QtGui
+from PyQt5 import QtWidgets, QtCore, QtGui, QtNetwork
 from PyQt5.QtCore import pyqtSlot
 import os.path
 import runpy
 import subprocess
+import signal, socket
 #from Cocoa import *
 
 from PyQt5.Qsci import QsciScintilla, QsciLexerPython, QsciLexerCPP
@@ -13,15 +14,23 @@ import asyncio
 
 from datetime import datetime
 
-from easyrpc.connection import autoconnect_from_env
+from easyrpc.connection import WebsocketConnection
 from easyrpc.rpc import RpcOp
 from easyrpc.db import blobstore
 from functools import wraps
+from base64 import urlsafe_b64encode
+config_dir = os.path.expanduser("~/.config/traythingy")
+os.makedirs(config_dir, exist_ok=True)
 
 def getConfigPath():
-	home = os.path.expanduser("~")
-	return os.path.join(home, ".config/traythingy/traythingy.json")
+	return os.path.join(config_dir, "traythingy.json")
 
+def file_get_contents(fn):
+	try:
+		with open(fn, "r") as f:
+			return f.read()
+	except:
+		pass
 
 def load_file_watch(parent, filename, callback):
 	def cb(p=""):
@@ -138,6 +147,8 @@ class DocDb:
 		if doc_id in self.documents: return
 		result = await self.rpc.caller.node('pb').pb.pb.get_updates([[doc_id, 0]], True)
 		for doc in result['docs']:
+			if 'server_error' in doc:
+				raise Exception(f"Failed to fetch document {doc['document']}: {doc['server_error']}")
 			await self._update_doc(doc['document'], doc['items'])
 	
 	async def get_items(self, doc_id):
@@ -165,7 +176,8 @@ class SystemTrayIcon(QtWidgets.QSystemTrayIcon):
 		action = self.menu.addAction(item['title'])
 		if 'icon' in item:
 			if len(item['icon']) < 3:
-				action.setText(item['icon'] + ' ' + item['title'])
+				#action.setText(item['icon'] + ' ' + item['title'])
+				action.setIcon(mkicon(item['icon']))
 			elif len(item['icon']) in (64, 86):
 				data = await blobstore.retrieve_blob(self.rpc, 'pb', 'pb', item['icon'], 10, cache=True)
 				#action.setIcon(QtGui.QIcon(data))
@@ -224,10 +236,12 @@ class SystemTrayIcon(QtWidgets.QSystemTrayIcon):
 		
 		
 		self.menu.addSeparator()
-		action = self.menu.addAction("↪️ Relaunch")
+		action = self.menu.addAction("Relaunch")
+		action.setIcon(mkicon("↪️"))
 		action.triggered.connect(lambda: self.run_cmd({'exec': 'sh -c "'+sys.argv[0]+' & kill '+str(os.getpid())+'"'}))
 		action = self.menu.addAction("Exit")
 		action.triggered.connect(self.exit)
+		action.setIcon(mkicon("❌"))
 
 	async def doAction(self, item):
 		print("running",item)
@@ -273,12 +287,12 @@ class SystemTrayIcon(QtWidgets.QSystemTrayIcon):
 
 	def __init__(self, icon, parent=None):
 		super().__init__(icon, parent)
+		self.setToolTip("meow")
 		self.menu = QtWidgets.QMenu(self.parent())
 		action = self.menu.addAction("Exit")
 		action.triggered.connect(self.exit)
 		self.setContextMenu(self.menu)
 		self.config = {}
-		self.activated.connect(self.on_activated)
 		self.db = None
 		load_file_watch(self, getConfigPath(), self.configChanged)
 		asyncio.ensure_future(self.connect_rpc())
@@ -294,8 +308,20 @@ class SystemTrayIcon(QtWidgets.QSystemTrayIcon):
 			return datetime.now().strftime(doc)
 
 	async def connect_rpc(self):
-		self.rpc = autoconnect_from_env()
-		await self.rpc.connect()
+		pk_file = os.path.join(config_dir, "private.key")
+		url = os.environ.get("RPC")
+		if not url:
+			url = file_get_contents(os.path.join(config_dir, "rpc.url")).strip()
+		self.rpc = WebsocketConnection(url=url, private_key_file=pk_file, request_username=os.environ["USER"])
+		#conn.connected.on(_on_connected)
+		#return conn
+		#self.rpc = autoconnect_from_env()
+		hello_params, hello_context = await self.rpc.connect(keep_trying=True)
+		self.showMessage(
+			"Connected to " + self.rpc.url,
+			"names: " + ", ".join(hello_params['names']) 
+			+ "\nlocal id: " + self.rpc.crypto.clientKeyPublicKeyString 
+			+ "\nremote id: "+ urlsafe_b64encode(hello_context.signed_with).decode(), SystemTrayIcon.Warning)
 		
 		self.db = DocDb(self.rpc)
 		self.db.remote_item_updated.on(self.on_remote_item_updated)
@@ -430,13 +456,35 @@ def showScintillaDialog(parent, title, content, ok_callback):
 	return sg.text()
 
 
+def mkicon(string, size=32):
+	image = QtGui.QImage(size, size, QtGui.QImage.Format_ARGB32)
+	image.fill(QtCore.Qt.transparent)
+	painter = QtGui.QPainter(image)
+	if not string: string = "?"
+	painter.setFont(QtGui.QFont("Noto Color Emoji", 28))
+	#painter.fillRect(0, 0, size, size, QtCore.Qt.white)
+	#painter.eraseRect(0, 0, size, size)
+	painter.drawText(0-4, size-4, str(string))
+	painter.end()
+	return QtGui.QIcon(QtGui.QPixmap.fromImage(image))
+
+class SignalWatchdog(QtNetwork.QAbstractSocket):
+	def __init__(self):
+		""" Propagates system signals from Python to QEventLoop """
+		super().__init__(QtNetwork.QAbstractSocket.SctpSocket, None)
+		self.writer, self.reader = socket.socketpair()
+		self.writer.setblocking(False)
+		signal.set_wakeup_fd(self.writer.fileno())  # Python hook
+		self.setSocketDescriptor(self.reader.fileno())  # Qt hook
+		self.readyRead.connect(lambda: None)  # Dummy function call
+
+
 import logging
 from easyrpc.helpers import CustomLogFormatter
 logging.basicConfig(level=logging.DEBUG)
 logging.root.handlers[0].setFormatter(CustomLogFormatter())
 
 def main():
-	image='rainbow_1f308.png'
 	app = QApplication(sys.argv)
 	
 	event_loop = QEventLoop(app)
@@ -444,9 +492,18 @@ def main():
 	app_close_event = asyncio.Event()
 	app.aboutToQuit.connect(app_close_event.set)
 
+	signalwatcher = SignalWatchdog()
+
+	def signal_handler(signal, frame):
+			print('Ctrl+C pressed, exiting')
+			app.quit()
+			
+	signal.signal(signal.SIGINT, signal_handler)
 	app.setQuitOnLastWindowClosed(False)
 	w = QtWidgets.QWidget()
-	trayIcon = SystemTrayIcon(QtGui.QIcon(image), w)
+	#icon=QtGui.QIcon('rainbow_1f308.png')
+	icon = mkicon('🌈')
+	trayIcon = SystemTrayIcon(icon, w)
 	trayIcon.show()
 
 	with event_loop:
